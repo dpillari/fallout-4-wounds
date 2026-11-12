@@ -13,9 +13,8 @@ namespace Config
 		"Meshes\\Gore\\BulletWoundSmall.nif",
 	};
 
-	// VISIBILITY TEST: big wounds, pushed OUT of the body. Set back to 1.0 / 0.25 once they show.
-	inline constexpr float       kWoundScale = 5.0f;          // world-space scale
-	inline constexpr float       kSinkDepth = -3.0f;          // game units pushed into the surface (negative = outward)
+	inline constexpr float       kWoundScale = 1.0f;          // world-space scale
+	inline constexpr float       kSinkDepth = 0.5f;           // game units pushed into the surface (negative = outward)
 	inline constexpr float       kNormalRadialWeight = 0.7f;  // estimated normal: 1 = outward from bone, 0 = toward shooter
 	inline constexpr bool        kUseImpactNormal = false;    // the event's "normal" turned out to be the shot direction
 	inline constexpr std::size_t kMaxWoundsPerActor = 10;
@@ -359,20 +358,67 @@ namespace
 		desired.translate = ToNi(a_hit.pos - normal * Config::kSinkDepth);
 		desired.scale = Config::kWoundScale;
 
-		wound->local = bone->world.Invert() * desired;
-
 		bone->AttachChild(wound.get(), true);
-		RE::NiUpdateData updateData{};
-		wound->UpdateDownwardPass(updateData, 0);
+
+		// The engine's matrix convention may be the transpose of CommonLib's
+		// maths. Try convention A, check where the wound actually ends up,
+		// and fall back to convention B if it's off.
+		const V3 wantPos = ToV3(desired.translate);
+		auto     place = [&](bool a_transposed) {
+            const auto&   bw = bone->world;
+            const float   bs = bw.scale > 1e-4f ? bw.scale : 1.0f;
+            RE::NiTransform local;
+            if (!a_transposed) {
+                local = bw.Invert() * desired;
+            } else {
+                // Rows are the axes: p_world = t + s * (R^T * p_local)
+                const RE::NiMatrix3 rb = bw.rotate;
+                const V3            d = (wantPos - ToV3(bw.translate)) * (1.0f / bs);
+                const V3            pl{
+                    rb.entry[0][0] * d.x + rb.entry[0][1] * d.y + rb.entry[0][2] * d.z,
+                    rb.entry[1][0] * d.x + rb.entry[1][1] * d.y + rb.entry[1][2] * d.z,
+                    rb.entry[2][0] * d.x + rb.entry[2][1] * d.y + rb.entry[2][2] * d.z
+                };
+                local.translate = ToNi(pl);
+                local.rotate = desired.rotate.Transpose() * rb.Transpose();
+                local.rotate = local.rotate.Transpose();
+                local.scale = desired.scale / bs;
+            }
+            wound->local = local;
+            RE::NiUpdateData updateData{};
+            wound->UpdateDownwardPass(updateData, 0);
+            return Len(ToV3(wound->world.translate) - wantPos);
+		};
+
+		static int s_convention = -1;  // -1 unknown, 0 = A, 1 = B (learned once)
+		float      err = 0.0f;
+		if (s_convention >= 0) {
+			err = place(s_convention == 1);
+		} else {
+			const float errA = place(false);
+			const float errB = place(true);
+			s_convention = errB + 0.01f < errA ? 1 : 0;
+			err = place(s_convention == 1);
+			REX::INFO("[spawn]   transform check: convention A off by {:.2f}, B off by {:.2f} -> using {}",
+				errA, errB, s_convention == 1 ? "B" : "A");
+		}
+		if (err > 1.0f) {
+			REX::WARN("[spawn]   wound placed {:.2f} units from target", err);
+		}
 
 		// DIAGNOSTIC: what did we attach, and where did it end up?
 		{
 			int  geometry = 0, culled = 0;
 			auto count = [&](auto& a_self, RE::NiAVObject* a_obj) -> void {
 				if (!a_obj) return;
-				if (a_obj->IsGeometry()) {
+				if (auto* geom = a_obj->IsGeometry()) {
 					++geometry;
 					if (a_obj->GetAppCulled()) ++culled;
+					REX::INFO("[spawn]   geometry '{}': skinned {}, shader {}, alpha {}, bound radius {:.2f}, world pos ({:.1f}, {:.1f}, {:.1f})",
+						a_obj->name.c_str(), static_cast<bool>(geom->skinInstance),
+						static_cast<bool>(geom->properties[1]), static_cast<bool>(geom->properties[0]),
+						a_obj->worldBound.fRadius,
+						a_obj->world.translate.x, a_obj->world.translate.y, a_obj->world.translate.z);
 				}
 				if (auto* n = a_obj->IsNode()) {
 					for (auto& c : n->children) a_self(a_self, c.get());
