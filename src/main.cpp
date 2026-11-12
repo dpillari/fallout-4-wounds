@@ -16,7 +16,7 @@ namespace Config
 	inline constexpr float       kWoundScale = 1.0f;          // world-space scale
 	inline constexpr float       kSinkDepth = 0.25f;          // game units pushed into the surface
 	inline constexpr float       kNormalRadialWeight = 0.7f;  // estimated normal: 1 = outward from bone, 0 = toward shooter
-	inline constexpr bool        kUseImpactNormal = true;     // prefer the engine's impact normal when it looks valid
+	inline constexpr bool        kUseImpactNormal = false;    // the event's "normal" turned out to be the shot direction
 	inline constexpr std::size_t kMaxWoundsPerActor = 10;
 	inline constexpr std::size_t kMaxActorsTracked = 64;
 	inline constexpr bool        kAffectPlayer = false;
@@ -382,57 +382,127 @@ namespace
 
 		RE::BSEventNotifyControl ProcessEvent(const RE::TESHitEvent& a_event, RE::BSTEventSource<RE::TESHitEvent>*) override
 		{
-			auto* targetRef = a_event.target.get();
-			auto* causeRef = a_event.cause.get();
+			// Fallout 4 sends two events per bullet:
+			//   A) usesHitData = true : impact position/direction/body, but `target` is empty
+			//   B) usesHitData = false: `target`/`cause` filled in, no impact data
+			// Use the target stored inside the hit data for (A); as a backup,
+			// pair (A) with the (B) that arrives right after it.
+			if (a_event.usesHitData) {
+				HandleImpactEvent(a_event);
+			} else {
+				HandleTargetEvent(a_event);
+			}
+			return RE::BSEventNotifyControl::kContinue;
+		}
+
+	private:
+		struct StoredImpact
+		{
+			PendingHit                            hit{};
+			RE::NiPointer<RE::NiAVObject>         hitObject;
+			std::chrono::steady_clock::time_point time{};
+			bool                                  valid = false;
+		};
+
+		std::mutex   _lock;
+		StoredImpact _lastUnclaimed;
+
+		static bool Filter(RE::Actor* a_actor, const RE::HitData* a_hitData, const char* a_tag)
+		{
+			if (!a_actor) {
+				return false;
+			}
+			if (!Config::kAffectPlayer && a_actor == RE::PlayerCharacter::GetSingleton()) {
+				REX::INFO("[{}] skipped {:08X}: player", a_tag, a_actor->GetFormID());
+				return false;
+			}
+			if (Config::kSkipMelee && a_hitData &&
+				a_hitData->flags.any(RE::HitData::Flag::kMeleeAttack, RE::HitData::Flag::kBash)) {
+				REX::INFO("[{}] skipped {:08X}: melee", a_tag, a_actor->GetFormID());
+				return false;
+			}
+			return true;
+		}
+
+		static void Queue(RE::Actor* a_actor, const PendingHit& a_hit, RE::NiAVObject* a_hitObject)
+		{
+			RE::NiPointer<RE::Actor>      actorRef(a_actor);
+			RE::NiPointer<RE::NiAVObject> hitRef(a_hitObject);
+			if (auto* tasks = F4SE::GetTaskInterface()) {
+				tasks->AddTask([actorRef, hitRef, a_hit]() {
+					SpawnWound(actorRef.get(), a_hit, hitRef.get());
+				});
+			}
+		}
+
+		void HandleImpactEvent(const RE::TESHitEvent& a_event)
+		{
 			const auto& impact = reinterpret_cast<const ImpactView&>(a_event.hitData.impactData);
-
-			// DIAGNOSTIC: log every hit we receive.
-			REX::INFO("[hit] target {:08X} cause {:08X} usesHitData {} proj {:08X} src {:08X} flags {:X} "
-					  "loc ({:.1f}, {:.1f}, {:.1f}) nrm ({:.2f}, {:.2f}, {:.2f}) vel ({:.1f}, {:.1f}, {:.1f}) colObj {}",
-				targetRef ? targetRef->GetFormID() : 0u, causeRef ? causeRef->GetFormID() : 0u,
-				a_event.usesHitData, a_event.projectileFormID, a_event.sourceFormID,
-				a_event.hitData.flags.underlying(),
-				impact.location.x, impact.location.y, impact.location.z,
-				impact.normal.x, impact.normal.y, impact.normal.z,
-				impact.velocity.x, impact.velocity.y, impact.velocity.z,
-				static_cast<bool>(impact.colObj));
-
-			auto* actor = targetRef ? targetRef->As<RE::Actor>() : nullptr;
-			if (!actor) {
-				REX::INFO("[hit]   skipped: target is not an actor");
-				return RE::BSEventNotifyControl::kContinue;
-			}
-			if (!Config::kAffectPlayer && actor == RE::PlayerCharacter::GetSingleton()) {
-				REX::INFO("[hit]   skipped: target is the player");
-				return RE::BSEventNotifyControl::kContinue;
-			}
-			if (Config::kSkipMelee && a_event.hitData.flags.any(RE::HitData::Flag::kMeleeAttack, RE::HitData::Flag::kBash)) {
-				REX::INFO("[hit]   skipped: melee");
-				return RE::BSEventNotifyControl::kContinue;
-			}
 
 			PendingHit hit{};
 			hit.pos = ToV3(impact.location);
 			hit.impactNormal = ToV3(impact.normal);
-			hit.shotDir = Normalize(ToV3(impact.velocity), { 0, 0, 0 });
+			hit.shotDir = Normalize(ToV3(impact.velocity), Normalize(ToV3(impact.normal), { 0, 0, 0 }));
 			if (IsZero(hit.pos)) {
-				REX::INFO("[hit]   skipped: no impact position (usesHitData {})", a_event.usesHitData);
-				return RE::BSEventNotifyControl::kContinue;
+				REX::INFO("[impact] skipped: no position");
+				return;
 			}
-
 			RE::NiAVObject* hitObject = impact.colObj ? impact.colObj->GetSceneGraphObject() : nullptr;
 
-			// Scene-graph edits must happen on the main thread; hold references
-			// so nothing is freed before the task runs.
-			RE::NiPointer<RE::Actor>      actorRef(actor);
-			RE::NiPointer<RE::NiAVObject> hitRef(hitObject);
-			REX::INFO("[hit]   queued wound task");
-			if (auto* tasks = F4SE::GetTaskInterface()) {
-				tasks->AddTask([actorRef, hitRef, hit]() {
-					SpawnWound(actorRef.get(), hit, hitRef.get());
-				});
+			// Target from the event, else from the hit data's handle.
+			RE::NiPointer<RE::Actor> actor;
+			if (auto* ref = a_event.target.get()) {
+				actor.reset(ref->As<RE::Actor>());
 			}
-			return RE::BSEventNotifyControl::kContinue;
+			if (!actor) {
+				actor = a_event.hitData.target.get();
+			}
+
+			if (actor) {
+				REX::INFO("[impact] {:08X} at ({:.1f}, {:.1f}, {:.1f}) flags {:X}",
+					actor->GetFormID(), hit.pos.x, hit.pos.y, hit.pos.z, a_event.hitData.flags.underlying());
+				if (Filter(actor.get(), &a_event.hitData, "impact")) {
+					Queue(actor.get(), hit, hitObject);
+				}
+				return;
+			}
+
+			// No target known yet: keep it for the matching target event.
+			REX::INFO("[impact] no target in hit data, waiting for target event");
+			std::scoped_lock lock(_lock);
+			_lastUnclaimed.hit = hit;
+			_lastUnclaimed.hitObject.reset(hitObject);
+			_lastUnclaimed.time = std::chrono::steady_clock::now();
+			_lastUnclaimed.valid = true;
+		}
+
+		void HandleTargetEvent(const RE::TESHitEvent& a_event)
+		{
+			auto* ref = a_event.target.get();
+			auto* actor = ref ? ref->As<RE::Actor>() : nullptr;
+			if (!actor) {
+				return;
+			}
+
+			StoredImpact stored;
+			{
+				std::scoped_lock lock(_lock);
+				const auto age = std::chrono::duration<double>(std::chrono::steady_clock::now() - _lastUnclaimed.time).count();
+				if (_lastUnclaimed.valid && age < 0.25) {
+					stored = _lastUnclaimed;
+					_lastUnclaimed.valid = false;
+				}
+			}
+
+			if (!stored.valid) {
+				// Usually fine: the impact event already found this target itself.
+				return;
+			}
+
+			REX::INFO("[target] {:08X} paired with stored impact", actor->GetFormID());
+			if (Filter(actor, nullptr, "target")) {
+				Queue(actor, stored.hit, stored.hitObject.get());
+			}
 		}
 	};
 

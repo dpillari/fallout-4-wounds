@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <deque>
+#include <mutex>
 #include <random>
 #include <unordered_map>
 #include <unordered_set>
