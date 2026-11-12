@@ -24,6 +24,11 @@ namespace Config
 	inline constexpr double      kDedupeSeconds = 0.05;
 	inline constexpr float       kDedupeDistance = 2.0f;
 
+	// Which axis of the wound NIF points OUT of the skin: 0 = X, 1 = Y, 2 = Z.
+	// Set kModelOutAxisNegative if it's the negative direction (-X/-Y/-Z).
+	inline constexpr int  kModelOutAxis = 2;
+	inline constexpr bool kModelOutAxisNegative = false;
+
 	// If wounds lie sideways or face into the body, flip this.
 	inline constexpr bool kTransposeRotation = false;
 }
@@ -63,8 +68,14 @@ namespace
 		const V3    x = x0 * c + y0 * s;
 		const V3    y = y0 * c - x0 * s;
 
+		// Map the model's "out" axis onto the surface normal (right-handed).
 		RE::NiMatrix3 m;
-		const V3      cols[3] = { x, y, z };
+		V3            cols[3];
+		switch (Config::kModelOutAxis) {
+			case 0:  cols[0] = z; cols[1] = x; cols[2] = y; break;  // model X -> normal
+			case 1:  cols[0] = y; cols[1] = z; cols[2] = x; break;  // model Y -> normal
+			default: cols[0] = x; cols[1] = y; cols[2] = z; break;  // model Z -> normal
+		}
 		for (int col = 0; col < 3; ++col) {
 			m.entry[0][col] = cols[col].x;
 			m.entry[1][col] = cols[col].y;
@@ -354,7 +365,7 @@ namespace
 		// Desired world transform, converted into the bone's space.
 		std::uniform_real_distribution<float> rollDist(0.0f, 6.2831853f);
 		RE::NiTransform                       desired;
-		desired.rotate = BasisFromNormal(normal, rollDist(g_rng));
+		desired.rotate = BasisFromNormal(Config::kModelOutAxisNegative ? -normal : normal, rollDist(g_rng));
 		desired.translate = ToNi(a_hit.pos - normal * Config::kSinkDepth);
 		desired.scale = Config::kWoundScale;
 
@@ -380,8 +391,9 @@ namespace
                     rb.entry[2][0] * d.x + rb.entry[2][1] * d.y + rb.entry[2][2] * d.z
                 };
                 local.translate = ToNi(pl);
+                // world R = local R * parent R (row-vector order), and the
+                // wanted world matrix has the axes as rows = basis^T.
                 local.rotate = desired.rotate.Transpose() * rb.Transpose();
-                local.rotate = local.rotate.Transpose();
                 local.scale = desired.scale / bs;
             }
             wound->local = local;
@@ -404,6 +416,17 @@ namespace
 		}
 		if (err > 1.0f) {
 			REX::WARN("[spawn]   wound placed {:.2f} units from target", err);
+		}
+		{
+			// Where does the model's out-axis point in the world now?
+			const auto& wr = wound->world.rotate;
+			const int   k = Config::kModelOutAxis;
+			V3          out = s_convention == 1 ?
+			                      V3{ wr.entry[k][0], wr.entry[k][1], wr.entry[k][2] } :  // rows are axes
+			                      V3{ wr.entry[0][k], wr.entry[1][k], wr.entry[2][k] };   // columns are axes
+			if (Config::kModelOutAxisNegative) out = -out;
+			const float d = Dot(Normalize(out, { 0, 0, 0 }), normal);
+			REX::INFO("[spawn]   orientation check: model out-axis vs surface normal = {:.2f} (1.00 = facing out, 0 = sideways, -1 = into body)", d);
 		}
 
 		// DIAGNOSTIC: what did we attach, and where did it end up?
