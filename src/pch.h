@@ -1,0 +1,15 @@
+#pragma once
+
+#include <RE/Fallout.h>
+#include <F4SE/F4SE.h>
+
+#include <algorithm>
+#include <cfloat>
+#include <chrono>
+#include <cmath>
+#include <deque>
+#include <random>
+#include <unordered_map>
+#include <unordered_set>
+
+using namespace std::literals;
