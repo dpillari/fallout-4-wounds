@@ -10,11 +10,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up the Visual Studio compiler
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: |
+          cmake --version
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
       - name: Build
-        run: cmake --build build --config RelWithDebInfo --parallel
+        run: cmake --build build --parallel
 
       - name: Upload DLL
         uses: actions/upload-artifact@v4
@@ -22,5 +29,5 @@ jobs:
           name: WoundMeshes-dll
           path: |
             output/WoundMeshes.dll
-            build/RelWithDebInfo/WoundMeshes.pdb
+            build/WoundMeshes.pdb
           if-no-files-found: error
