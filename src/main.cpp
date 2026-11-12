@@ -290,10 +290,13 @@ namespace
 	void SpawnWound(RE::Actor* a_actor, const PendingHit& a_hit, RE::NiAVObject* a_hitObject)
 	{
 		if (!a_actor) {
+			REX::INFO("[spawn] skipped: actor gone");
 			return;
 		}
+		REX::INFO("[spawn] task running");
 		auto* root = a_actor->Get3D();
 		if (!root) {
+			REX::INFO("[spawn] {:08X}: skipped, actor has no 3D", a_actor->GetFormID());
 			return;
 		}
 
@@ -304,6 +307,7 @@ namespace
 		const auto now = std::chrono::steady_clock::now();
 		if (std::chrono::duration<double>(now - entry.lastHit).count() < Config::kDedupeSeconds &&
 			Len(a_hit.pos - entry.lastPos) < Config::kDedupeDistance) {
+			REX::INFO("[spawn] {:08X}: skipped, duplicate of previous hit", formID);
 			return;
 		}
 		entry.lastHit = now;
@@ -378,29 +382,41 @@ namespace
 
 		RE::BSEventNotifyControl ProcessEvent(const RE::TESHitEvent& a_event, RE::BSTEventSource<RE::TESHitEvent>*) override
 		{
-			if (!a_event.usesHitData) {
-				return RE::BSEventNotifyControl::kContinue;
-			}
-
 			auto* targetRef = a_event.target.get();
+			auto* causeRef = a_event.cause.get();
+			const auto& impact = reinterpret_cast<const ImpactView&>(a_event.hitData.impactData);
+
+			// DIAGNOSTIC: log every hit we receive.
+			REX::INFO("[hit] target {:08X} cause {:08X} usesHitData {} proj {:08X} src {:08X} flags {:X} "
+					  "loc ({:.1f}, {:.1f}, {:.1f}) nrm ({:.2f}, {:.2f}, {:.2f}) vel ({:.1f}, {:.1f}, {:.1f}) colObj {}",
+				targetRef ? targetRef->GetFormID() : 0u, causeRef ? causeRef->GetFormID() : 0u,
+				a_event.usesHitData, a_event.projectileFormID, a_event.sourceFormID,
+				a_event.hitData.flags.underlying(),
+				impact.location.x, impact.location.y, impact.location.z,
+				impact.normal.x, impact.normal.y, impact.normal.z,
+				impact.velocity.x, impact.velocity.y, impact.velocity.z,
+				static_cast<bool>(impact.colObj));
+
 			auto* actor = targetRef ? targetRef->As<RE::Actor>() : nullptr;
 			if (!actor) {
+				REX::INFO("[hit]   skipped: target is not an actor");
 				return RE::BSEventNotifyControl::kContinue;
 			}
 			if (!Config::kAffectPlayer && actor == RE::PlayerCharacter::GetSingleton()) {
+				REX::INFO("[hit]   skipped: target is the player");
 				return RE::BSEventNotifyControl::kContinue;
 			}
 			if (Config::kSkipMelee && a_event.hitData.flags.any(RE::HitData::Flag::kMeleeAttack, RE::HitData::Flag::kBash)) {
+				REX::INFO("[hit]   skipped: melee");
 				return RE::BSEventNotifyControl::kContinue;
 			}
-
-			const auto& impact = reinterpret_cast<const ImpactView&>(a_event.hitData.impactData);
 
 			PendingHit hit{};
 			hit.pos = ToV3(impact.location);
 			hit.impactNormal = ToV3(impact.normal);
 			hit.shotDir = Normalize(ToV3(impact.velocity), { 0, 0, 0 });
 			if (IsZero(hit.pos)) {
+				REX::INFO("[hit]   skipped: no impact position (usesHitData {})", a_event.usesHitData);
 				return RE::BSEventNotifyControl::kContinue;
 			}
 
@@ -410,6 +426,7 @@ namespace
 			// so nothing is freed before the task runs.
 			RE::NiPointer<RE::Actor>      actorRef(actor);
 			RE::NiPointer<RE::NiAVObject> hitRef(hitObject);
+			REX::INFO("[hit]   queued wound task");
 			if (auto* tasks = F4SE::GetTaskInterface()) {
 				tasks->AddTask([actorRef, hitRef, hit]() {
 					SpawnWound(actorRef.get(), hit, hitRef.get());
