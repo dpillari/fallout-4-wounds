@@ -13,8 +13,9 @@ namespace Config
 		"Meshes\\Gore\\BulletWoundSmall.nif",
 	};
 
-	inline constexpr float       kWoundScale = 1.0f;          // world-space scale
-	inline constexpr float       kSinkDepth = 0.25f;          // game units pushed into the surface
+	// VISIBILITY TEST: big wounds, pushed OUT of the body. Set back to 1.0 / 0.25 once they show.
+	inline constexpr float       kWoundScale = 5.0f;          // world-space scale
+	inline constexpr float       kSinkDepth = -3.0f;          // game units pushed into the surface (negative = outward)
 	inline constexpr float       kNormalRadialWeight = 0.7f;  // estimated normal: 1 = outward from bone, 0 = toward shooter
 	inline constexpr bool        kUseImpactNormal = false;    // the event's "normal" turned out to be the shot direction
 	inline constexpr std::size_t kMaxWoundsPerActor = 10;
@@ -329,6 +330,16 @@ namespace
 			return;
 		}
 
+		// A freshly loaded fade node starts fully faded out unless the game's
+		// fade manager handles it - force it visible.
+		bool isFade = false;
+		if (auto* fade = wound->IsFadeNode()) {
+			isFade = true;
+			fade->currentFade = 1.0f;
+			fade->currentDecalFade = 1.0f;
+		}
+		wound->SetAppCulled(false);
+
 		// Surface normal.
 		const V3    towardShooter = Normalize(-a_hit.shotDir, { 0, 0, 1 });
 		V3          normal = EstimateNormal(bone, a_hit.pos, towardShooter);
@@ -353,6 +364,27 @@ namespace
 		bone->AttachChild(wound.get(), true);
 		RE::NiUpdateData updateData{};
 		wound->UpdateDownwardPass(updateData, 0);
+
+		// DIAGNOSTIC: what did we attach, and where did it end up?
+		{
+			int  geometry = 0, culled = 0;
+			auto count = [&](auto& a_self, RE::NiAVObject* a_obj) -> void {
+				if (!a_obj) return;
+				if (a_obj->IsGeometry()) {
+					++geometry;
+					if (a_obj->GetAppCulled()) ++culled;
+				}
+				if (auto* n = a_obj->IsNode()) {
+					for (auto& c : n->children) a_self(a_self, c.get());
+				}
+			};
+			count(count, wound.get());
+			const V3 wpos = ToV3(wound->world.translate);
+			REX::INFO("[spawn]   model: fadeNode {}, geometry {} ({} culled), world pos ({:.1f}, {:.1f}, {:.1f}) "
+					  "= {:.1f} units from hit, world scale {:.2f}, parent '{}'",
+				isFade, geometry, culled, wpos.x, wpos.y, wpos.z, Len(wpos - a_hit.pos), wound->world.scale,
+				wound->parent ? wound->parent->name.c_str() : "<none>");
+		}
 
 		g_ourNodes.insert(wound.get());
 		entry.wounds.push_back(wound);
