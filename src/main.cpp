@@ -13,24 +13,93 @@ namespace Config
 		"Meshes\\Gore\\BulletWoundSmall.nif",
 	};
 
-	inline constexpr float       kWoundScale = 1.0f;          // world-space scale
-	inline constexpr float       kSinkDepth = 0.5f;           // game units pushed into the surface (negative = outward)
 	inline constexpr float       kNormalRadialWeight = 0.7f;  // estimated normal: 1 = outward from bone, 0 = toward shooter
 	inline constexpr bool        kUseImpactNormal = false;    // the event's "normal" turned out to be the shot direction
-	inline constexpr std::size_t kMaxWoundsPerActor = 10;
 	inline constexpr std::size_t kMaxActorsTracked = 64;
-	inline constexpr bool        kAffectPlayer = false;
-	inline constexpr bool        kSkipMelee = true;
 	inline constexpr double      kDedupeSeconds = 0.05;
 	inline constexpr float       kDedupeDistance = 2.0f;
 
-	// Which axis of the wound NIF points OUT of the skin: 0 = X, 1 = Y, 2 = Z.
-	// Set kModelOutAxisNegative if it's the negative direction (-X/-Y/-Z).
-	inline constexpr int  kModelOutAxis = 2;
-	inline constexpr bool kModelOutAxisNegative = false;
-
 	// If wounds lie sideways or face into the body, flip this.
 	inline constexpr bool kTransposeRotation = false;
+}
+
+// Runtime settings: Data\F4SE\Plugins\WoundMeshes.ini, re-read whenever the file
+// changes, so values can be tuned while the game is running.
+namespace Settings
+{
+	inline std::atomic<float> scale{ 2.0f };
+	inline std::atomic<float> sinkDepth{ 3.5f };
+	inline std::atomic<int>   maxWoundsPerActor{ 10 };
+	inline std::atomic<bool>  affectPlayer{ false };
+	inline std::atomic<bool>  skipMelee{ true };
+	inline std::atomic<int>   modelOutAxis{ 2 };
+	inline std::atomic<bool>  modelOutAxisNegative{ false };
+
+	inline constexpr const char* kPath = "Data\\F4SE\\Plugins\\WoundMeshes.ini";
+	inline std::filesystem::file_time_type g_lastWrite{};
+
+	inline void WriteDefaults()
+	{
+		std::ofstream f(kPath);
+		f << "; WoundMeshes settings - saved changes apply to the next wound, no restart needed.\n"
+			 "[General]\n"
+			 "; Size of each wound (1.0 = the NIF's own size)\n"
+			 "Scale=2.0\n"
+			 "; How far to push the wound into the body, in game units (1 unit ~ 1.4 cm).\n"
+			 "; Raise it if wounds float above the skin, lower it if they disappear inside.\n"
+			 "SinkDepth=3.5\n"
+			 "MaxWoundsPerActor=10\n"
+			 "AffectPlayer=0\n"
+			 "SkipMelee=1\n"
+			 "\n[Model]\n"
+			 "; Which axis of the NIF points out of the skin: 0 = X, 1 = Y, 2 = Z\n"
+			 "OutAxis=2\n"
+			 "; 1 if it's the negative direction (-X / -Y / -Z)\n"
+			 "OutAxisNegative=0\n";
+	}
+
+	inline void ReloadIfChanged()
+	{
+		std::error_code ec;
+		if (!std::filesystem::exists(kPath, ec)) {
+			WriteDefaults();
+		}
+		const auto t = std::filesystem::last_write_time(kPath, ec);
+		if (ec || t == g_lastWrite) {
+			return;
+		}
+		g_lastWrite = t;
+
+		std::ifstream f(kPath);
+		std::string   line;
+		while (std::getline(f, line)) {
+			const auto eq = line.find('=');
+			if (line.empty() || line[0] == ';' || line[0] == '[' || eq == std::string::npos) {
+				continue;
+			}
+			auto trim = [](std::string a_s) {
+				const auto b = a_s.find_first_not_of(" \t\r");
+				const auto e = a_s.find_last_not_of(" \t\r");
+				return b == std::string::npos ? std::string{} : a_s.substr(b, e - b + 1);
+			};
+			const std::string key = trim(line.substr(0, eq));
+			const std::string val = trim(line.substr(eq + 1));
+			try {
+				if (key == "Scale") scale = std::stof(val);
+				else if (key == "SinkDepth") sinkDepth = std::stof(val);
+				else if (key == "MaxWoundsPerActor") maxWoundsPerActor = std::max(1, std::stoi(val));
+				else if (key == "AffectPlayer") affectPlayer = std::stoi(val) != 0;
+				else if (key == "SkipMelee") skipMelee = std::stoi(val) != 0;
+				else if (key == "OutAxis") modelOutAxis = std::clamp(std::stoi(val), 0, 2);
+				else if (key == "OutAxisNegative") modelOutAxisNegative = std::stoi(val) != 0;
+			} catch (...) {
+				REX::WARN("Bad value in WoundMeshes.ini: {}", line);
+			}
+		}
+		REX::INFO("Settings loaded: Scale {:.2f}, SinkDepth {:.2f}, MaxWoundsPerActor {}, AffectPlayer {}, SkipMelee {}, OutAxis {}{}",
+			scale.load(), sinkDepth.load(), maxWoundsPerActor.load(), affectPlayer.load(), skipMelee.load(),
+			modelOutAxisNegative.load() ? "-" : "+", "XYZ"[modelOutAxis.load()]);
+	}
 }
 
 namespace
@@ -71,7 +140,7 @@ namespace
 		// Map the model's "out" axis onto the surface normal (right-handed).
 		RE::NiMatrix3 m;
 		V3            cols[3];
-		switch (Config::kModelOutAxis) {
+		switch (Settings::modelOutAxis.load()) {
 			case 0:  cols[0] = z; cols[1] = x; cols[2] = y; break;  // model X -> normal
 			case 1:  cols[0] = y; cols[1] = z; cols[2] = x; break;  // model Y -> normal
 			default: cols[0] = x; cols[1] = y; cols[2] = z; break;  // model Z -> normal
@@ -304,7 +373,7 @@ namespace
 			REX::INFO("[spawn] skipped: actor gone");
 			return;
 		}
-		REX::INFO("[spawn] task running");
+		Settings::ReloadIfChanged();
 		auto* root = a_actor->Get3D();
 		if (!root) {
 			REX::INFO("[spawn] {:08X}: skipped, actor has no 3D", a_actor->GetFormID());
@@ -365,9 +434,9 @@ namespace
 		// Desired world transform, converted into the bone's space.
 		std::uniform_real_distribution<float> rollDist(0.0f, 6.2831853f);
 		RE::NiTransform                       desired;
-		desired.rotate = BasisFromNormal(Config::kModelOutAxisNegative ? -normal : normal, rollDist(g_rng));
-		desired.translate = ToNi(a_hit.pos - normal * Config::kSinkDepth);
-		desired.scale = Config::kWoundScale;
+		desired.rotate = BasisFromNormal(Settings::modelOutAxisNegative ? -normal : normal, rollDist(g_rng));
+		desired.translate = ToNi(a_hit.pos - normal * Settings::sinkDepth.load());
+		desired.scale = Settings::scale.load();
 
 		bone->AttachChild(wound.get(), true);
 
@@ -420,11 +489,11 @@ namespace
 		{
 			// Where does the model's out-axis point in the world now?
 			const auto& wr = wound->world.rotate;
-			const int   k = Config::kModelOutAxis;
+			const int   k = Settings::modelOutAxis.load();
 			V3          out = s_convention == 1 ?
 			                      V3{ wr.entry[k][0], wr.entry[k][1], wr.entry[k][2] } :  // rows are axes
 			                      V3{ wr.entry[0][k], wr.entry[1][k], wr.entry[2][k] };   // columns are axes
-			if (Config::kModelOutAxisNegative) out = -out;
+			if (Settings::modelOutAxisNegative) out = -out;
 			const float d = Dot(Normalize(out, { 0, 0, 0 }), normal);
 			REX::INFO("[spawn]   orientation check: model out-axis vs surface normal = {:.2f} (1.00 = facing out, 0 = sideways, -1 = into body)", d);
 		}
@@ -457,7 +526,7 @@ namespace
 
 		g_ourNodes.insert(wound.get());
 		entry.wounds.push_back(wound);
-		while (entry.wounds.size() > Config::kMaxWoundsPerActor) {
+		while (entry.wounds.size() > static_cast<std::size_t>(Settings::maxWoundsPerActor.load())) {
 			if (auto& oldest = entry.wounds.front()) {
 				DetachWound(oldest.get());
 			}
@@ -513,11 +582,11 @@ namespace
 			if (!a_actor) {
 				return false;
 			}
-			if (!Config::kAffectPlayer && a_actor == RE::PlayerCharacter::GetSingleton()) {
+			if (!Settings::affectPlayer && a_actor == RE::PlayerCharacter::GetSingleton()) {
 				REX::INFO("[{}] skipped {:08X}: player", a_tag, a_actor->GetFormID());
 				return false;
 			}
-			if (Config::kSkipMelee && a_hitData &&
+			if (Settings::skipMelee && a_hitData &&
 				a_hitData->flags.any(RE::HitData::Flag::kMeleeAttack, RE::HitData::Flag::kBash)) {
 				REX::INFO("[{}] skipped {:08X}: melee", a_tag, a_actor->GetFormID());
 				return false;
@@ -613,6 +682,7 @@ namespace
 			return;
 		}
 		if (auto* source = RE::TESHitEvent::GetEventSource()) {
+			Settings::ReloadIfChanged();
 			source->RegisterSink(HitSink::GetSingleton());
 			REX::INFO("Hit event sink registered");
 		} else {

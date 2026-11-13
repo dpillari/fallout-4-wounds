@@ -29,5 +29,6 @@ jobs:
           name: WoundMeshes-dll
           path: |
             output/WoundMeshes.dll
+            dist/WoundMeshes.ini
             build/WoundMeshes.pdb
           if-no-files-found: error
